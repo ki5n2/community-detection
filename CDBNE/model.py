@@ -15,243 +15,233 @@ from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
 
 
-
 #%%
 class CDBNE(nn.Module):
-    def __init__(self, input_dim, hidden_dim, embedding_dim, n_clusters):
-        """
-        CDBNE: Community Detection Based on Network Embedding
-        
-        Args:
-            input_dim: Number of input features
-            hidden_dim: Dimension of hidden layer
-            embedding_dim: Dimension of embedding
-            n_clusters: Number of clusters/communities
-        """
+    def __init__(self, input_dim, hidden_dim, embedding_dim, n_clusters, alpha=1.0):
         super(CDBNE, self).__init__()
-        
-        # Graph Attention Auto-encoder
-        # Encoder
-        self.encoder_gat1 = GATConv(input_dim, hidden_dim)
-        self.encoder_gat2 = GATConv(hidden_dim, embedding_dim)
-        
-        # Decoder
-        self.decoder_gat1 = GATConv(embedding_dim, hidden_dim)
-        self.decoder_gat2 = GATConv(hidden_dim, input_dim)
-        
-        # Clustering layer
-        self.cluster_layer = nn.Parameter(torch.Tensor(n_clusters, embedding_dim))
-        torch.nn.init.xavier_normal_(self.cluster_layer.data)
-        
-        # Parameters
+        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.embedding_dim = embedding_dim
         self.n_clusters = n_clusters
+        self.alpha = alpha
         
+        # Encoder with proper initialization
+        self.encoder_gat1 = GATConv(input_dim, hidden_dim)
+        self.encoder_gat2 = GATConv(hidden_dim, embedding_dim)
+        
+        # Decoder with proper initialization
+        self.decoder_gat1 = GATConv(embedding_dim, hidden_dim)
+        self.decoder_gat2 = GATConv(hidden_dim, input_dim)
+        
+        # Clustering layer initialized with small random values
+        self.cluster_layer = nn.Parameter(torch.randn(n_clusters, embedding_dim) * 0.1)
+        # torch.nn.init.xavier_normal_(self.cluster_layer.data)
+
     def encode(self, x, edge_index):
-        """
-        Encode the input data using Graph Attention layers
-        """
-        # First GAT layer with ReLU activation
         h1 = F.relu(self.encoder_gat1(x, edge_index))
-        # Second GAT layer
         z = self.encoder_gat2(h1, edge_index)
         return z
-        
+
     def decode(self, z, edge_index):
-        """
-        Decode the embeddings back to reconstruct input
-        """
-        # First decoder GAT layer with ReLU activation
         h1 = F.relu(self.decoder_gat1(z, edge_index))
-        # Second decoder GAT layer
         x_hat = self.decoder_gat2(h1, edge_index)
         return x_hat
-        
+
     def forward(self, x, edge_index):
-        """
-        Forward pass through the network
-        """
+        # Apply layer normalization to input
+        x = F.normalize(x, p=2, dim=1)
+        
         # Get embeddings
         z = self.encode(x, edge_index)
         
-        # Reconstruction
-        x_hat = self.decode(z, edge_index)
+        # Apply normalization to embeddings
+        z = F.normalize(z, p=2, dim=1)
         
-        # Calculate cluster assignments (Q)
+        # Get reconstruction and cluster probabilities
+        x_hat = self.decode(z, edge_index)
         q = self.get_cluster_prob(z)
         
         return z, x_hat, q
-    
+
     def get_cluster_prob(self, z):
-        """
-        Calculate probability of assignments to clusters using Student's t-distribution
-        """
-        q = 1.0 / (1.0 + torch.sum(
-            torch.pow(z.unsqueeze(1) - self.cluster_layer, 2), 2) / 1.0)
-        q = q.pow(0.5)  # degree of freedom = 1
-        q = (q.t() / torch.sum(q, 1)).t()
+        z_norm = torch.sum(torch.square(z), dim=1, keepdim=True)
+        cluster_norm = torch.sum(torch.square(self.cluster_layer), dim=1, keepdim=True)
+        dist = z_norm + cluster_norm.t() - 2 * torch.mm(z, self.cluster_layer.t())
+        q = 1.0 / (1.0 + (dist / self.alpha))
+        q = (q + 1e-7) ** ((self.alpha + 1.0) / 2.0)
+        q = (q.t() / torch.sum(q, dim=1)).t()
         return q
 
-    def loss_reconstruction(self, x, x_hat, edge_index):
-        """
-        Calculate reconstruction loss
-        """
-        # Attribute reconstruction loss
-        loss_attr = F.mse_loss(x_hat, x)
-        
-        # Structure reconstruction loss
-        # Using inner product between node embeddings as edge predictions
-        z = self.encode(x, edge_index)
-        adj_pred = torch.sigmoid(torch.mm(z, z.t()))
-        
-        # Create adjacency matrix from edge_index
-        adj_true = torch.zeros((x.size(0), x.size(0)), device=x.device)
-        adj_true[edge_index[0], edge_index[1]] = 1
-        
-        loss_struct = F.binary_cross_entropy(adj_pred, adj_true)
-        
-        return loss_attr + loss_struct
-
+    # def loss_modularity(self, z, adj):
+    #     adj = adj.to(z.device)
+    #     degrees = torch.sum(adj, dim=1)
+    #     m = torch.sum(adj) / 2.0
+    #     B = adj - torch.outer(degrees, degrees) / (2.0 * m)
+    #     H = F.softmax(torch.mm(z, self.cluster_layer.t()), dim=1)
+    #     Q = torch.trace(torch.mm(torch.mm(H.t(), B), H)) / (4.0 * m)
+    #     return -Q
     def loss_modularity(self, z, adj):
         """
-        Calculate modularity loss
+        Calculate modularity loss according to equation (11) in the paper
+        Q = 1/4m * Tr(H^T B H)
+        where B = A - dd^T/2m is the modularity matrix
         """
-        # Ensure adj is on the same device as the model
-        adj = adj.to(z.device)
+        # Ensure input is float and on correct device
+        adj = adj.to(z.device).float()
         
-        # Calculate degrees
+        # Calculate degrees (d) and total number of edges (m)
         degrees = torch.sum(adj, dim=1)
-        m = torch.sum(adj) / 2
+        m = torch.sum(adj) / 2.0
         
-        # Calculate modularity matrix B
-        B = adj - torch.outer(degrees, degrees) / (2 * m)
+        # Normalize degrees for numerical stability
+        degrees = degrees / (2.0 * m)
+        
+        # Calculate modularity matrix B = A - dd^T/(2m)
+        # Using outer product for dd^T
+        B = adj - torch.outer(degrees, degrees) * (2.0 * m)
         
         # Calculate community assignments using softmax
+        # H shape: (n_nodes, n_clusters)
         H = F.softmax(torch.mm(z, self.cluster_layer.t()), dim=1)
         
-        # Calculate modularity
-        Q = torch.trace(torch.mm(torch.mm(H.t(), B), H)) / (4 * m)
+        # Calculate modularity Q = 1/4m * Tr(H^T B H)
+        # First calculate H^T B H
+        HtB = torch.mm(H.t(), B)  # (n_clusters, n_nodes)
+        HtBH = torch.mm(HtB, H)   # (n_clusters, n_clusters)
+        Q = torch.trace(HtBH) / (4.0 * m)
         
+        # Print debug information
+        if torch.isnan(Q) or torch.isinf(Q):
+            print("Warning: Q is nan or inf")
+            print(f"m: {m}")
+            print(f"degrees min/max: {degrees.min()}/{degrees.max()}")
+            print(f"B min/max: {B.min()}/{B.max()}")
+            print(f"H min/max: {H.min()}/{H.max()}")
+            print(f"Q: {Q}")
+        
+        # Add small epsilon to avoid numerical instability
+        Q = Q + 1e-10
+    
         return -Q  # Return negative since we want to maximize modularity
+
+    def loss_reconstruction(self, x, x_hat, edge_index):
+        loss_attr = F.mse_loss(x_hat, x)
+        z = self.encode(x, edge_index)
+        adj_pred = torch.sigmoid(torch.mm(z, z.t()))
+        adj_true = torch.zeros((x.size(0), x.size(0)), device=x.device)
+        adj_true[edge_index[0], edge_index[1]] = 1
+        loss_struct = F.binary_cross_entropy(adj_pred, adj_true)
+        return loss_attr + loss_struct
 
 
 #%%
 class CDBNE_Trainer:
-    def __init__(self, model, optimizer, device, 
-                 beta=0.1, gamma=1.0, update_interval=1):
+    def __init__(self, model, optimizer, device, beta=0.1, gamma=1.0, update_interval=1):
         self.model = model
         self.optimizer = optimizer
         self.device = device
         self.beta = beta
         self.gamma = gamma
         self.update_interval = update_interval
-
+        # Learning rate scheduler 추가
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=10, verbose=True
+        )
+        
     def calculate_target_dist(self, q):
-        """
-        Calculate auxiliary target distribution P
-        Args:
-            q: cluster soft assignments (size: n_samples x n_clusters)
-        Returns:
-            target distribution P
-        """
-        # Get weight of each sample to its assigned cluster
-        weight = (q ** 2) / torch.sum(q, dim=0)
-        # Normalize weight
-        p = weight / torch.sum(weight, dim=1, keepdim=True)
+        f = torch.sum(q, dim=0)
+        numerator = q ** 2 / f
+        denominator = torch.sum(numerator, dim=1, keepdim=True)
+        p = numerator / denominator
         return p
 
     def train_step(self, data, target_dist=None):
-        """
-        Single training step
-        """
         self.model.train()
         self.optimizer.zero_grad()
         
-        # Forward pass
         z, x_hat, q = self.model(data.x, data.edge_index)
-        
-        # Calculate reconstruction and modularity losses
         loss_recon = self.model.loss_reconstruction(data.x, x_hat, data.edge_index)
         loss_mod = self.model.loss_modularity(z, data.adj)
         
-        # Calculate clustering loss if target distribution is provided
         loss_cluster = 0
         if target_dist is not None:
-            # KL divergence
-            loss_cluster = F.kl_div(q.log(), target_dist)
+            loss_cluster = torch.sum(target_dist * torch.log(target_dist / (q + 1e-7)))
         
-        # Total loss
         loss = loss_recon - self.beta * loss_mod + self.gamma * loss_cluster
         
-        # Backward pass
         loss.backward()
         self.optimizer.step()
         
         return loss.item(), q
 
     def pretrain(self, data, epochs):
-        """
-        Pretrain the model using only reconstruction and modularity loss
-        """
         self.model.train()
+        best_loss = float('inf')
+        
         for epoch in range(epochs):
             self.optimizer.zero_grad()
             
             # Forward pass
             z, x_hat, _ = self.model(data.x, data.edge_index)
             
-            # Calculate losses
+            # Calculate losses with scale normalization
             loss_recon = self.model.loss_reconstruction(data.x, x_hat, data.edge_index)
             loss_mod = self.model.loss_modularity(z, data.adj)
             
-            # Total loss
-            loss = loss_recon - self.beta * loss_mod
+            # Scale normalization
+            if epoch == 0:
+                self.recon_scale = loss_recon.item()
+                self.mod_scale = abs(loss_mod.item()) + 1e-8
             
-            # Backward pass
+            loss = (loss_recon / self.recon_scale) - self.beta * (loss_mod / self.mod_scale)
+            
+            # Backward pass with gradient clipping
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
             
+            # Learning rate scheduling
+            self.scheduler.step(loss)
+            
+            # Print progress
             if (epoch + 1) % 100 == 0:
-                print(f'Pretrain Epoch {epoch+1}: Loss = {loss.item():.4f}')
-        
+                print(f'Pretrain Epoch {epoch+1}: Loss = {loss.item():.4f} '
+                      f'(Recon = {loss_recon.item():.4f}, Mod = {loss_mod.item():.4f})')
+            
+            # Early stopping
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                best_z = z.detach()
+            
+            # Check for convergence
+            if epoch > 0 and abs(loss.item() - best_loss) < 1e-6:
+                print("Converged early at epoch", epoch)
+                break
+            
         # Initialize cluster centers using K-means
         kmeans = KMeans(n_clusters=self.model.n_clusters, n_init=20)
-        z_np = z.detach().cpu().numpy()
+        z_np = best_z.cpu().numpy()
         y_pred = kmeans.fit_predict(z_np)
-        # Convert y_pred to tensor and move to correct device
         y_pred = torch.tensor(y_pred, dtype=torch.long, device=self.device)
         self.model.cluster_layer.data = torch.tensor(
             kmeans.cluster_centers_, device=self.device
         )
-        
         return y_pred
-
+    
     def train(self, data, epochs, pretrain_epochs=100):
-        """
-        Full training process
-        """
-        # Pretrain the model
         print("Pretraining...")
         y_pred = self.pretrain(data, pretrain_epochs)
         
-        # Main training loop
         print("Training...")
         for epoch in range(epochs):
-            # Get cluster assignments
             _, _, q = self.model(data.x, data.edge_index)
             
-            # Update target distribution if needed
             if epoch % self.update_interval == 0:
                 target_dist = self.calculate_target_dist(q.detach())
-                
-                # Monitor cluster assignment changes
                 max_probs, new_pred = q.max(1)
-                # Convert predictions to same device and type
                 new_pred = new_pred.to(self.device)
                 y_pred = y_pred.to(self.device)
                 
-                # Calculate label changes using torch operations
                 delta_label = torch.sum(new_pred != y_pred).float() / new_pred.shape[0]
                 delta_label = delta_label.item()
                 
@@ -259,11 +249,10 @@ class CDBNE_Trainer:
                 
                 print(f'Epoch {epoch}: Label change = {delta_label:.4f}')
                 
-                # if delta_label < 0.001:  # Convergence check
+                # if delta_label < 0.001:
                 #     print("Reached convergence threshold. Training stopped.")
                 #     break
             
-            # Training step
             loss, _ = self.train_step(data, target_dist)
             
             if (epoch + 1) % 10 == 0:
@@ -273,14 +262,9 @@ class CDBNE_Trainer:
     
 
 def prepare_data(edge_index, features, n_nodes, device):
-    """
-    Prepare adjacency matrix and other data structures
-    """
-    # Create adjacency matrix
-    adj = torch.zeros((n_nodes, n_nodes), device=device)  # Move to specified device
+    adj = torch.zeros((n_nodes, n_nodes), device=device)
     adj[edge_index[0], edge_index[1]] = 1
     
-    # Create data object
     class Data:
         def __init__(self):
             pass
@@ -337,6 +321,8 @@ class CDBNE_Evaluator:
             'ARI': ari
         }
 
+
+#%%
 class CDBNE_Visualizer:
     @staticmethod
     def plot_tsne(embeddings, labels, title='t-SNE Visualization'):
@@ -355,85 +341,67 @@ class CDBNE_Visualizer:
         plt.title(title)
         plt.show()
 
+
+#%%
 def main():
-    # Set random seeds for reproducibility
     torch.manual_seed(42)
     np.random.seed(42)
     
-    # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Load dataset (using Cora as example)
     dataset = Planetoid(root='/tmp/Cora', name='Cora', transform=T.NormalizeFeatures())
     data = dataset[0]
     
-    # Move data to device
     data.x = data.x.to(device)
     data.edge_index = data.edge_index.to(device)
     
-    # Initialize model parameters
+    # Model parameters
     input_dim = dataset.num_features
     hidden_dim = 256
     embedding_dim = 16
     n_clusters = dataset.num_classes
+    alpha = 1.0  # degrees of freedom for Student's t-distribution
     
-    # Create model
     model = CDBNE(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         embedding_dim=embedding_dim,
-        n_clusters=n_clusters
+        n_clusters=n_clusters,
+        alpha=alpha
     ).to(device)
     
-    # Initialize optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=5e-3) # cora = 0.0001
     
-    # Create trainer
     trainer = CDBNE_Trainer(
         model=model,
         optimizer=optimizer,
         device=device,
-        beta=0.1,
-        gamma=1.0
+        beta=0.1,  # modularity loss weight
+        gamma=1.0  # clustering loss weight
     )
     
-    # Prepare data
-    data_obj = prepare_data(
-        data.edge_index,
-        data.x,
-        data.num_nodes,
-        device  # Pass device to prepare_data
-    )
+    data_obj = prepare_data(data.edge_index, data.x, data.num_nodes, device)
     
-    # Training
     print("Starting training...")
-    y_pred = trainer.train(
-        data=data_obj,
-        epochs=500,
-        pretrain_epochs=100
-    )
-
-    # Move predictions to CPU for evaluation
-    y_pred_cpu = y_pred.cpu()
+    y_pred = trainer.train(data_obj, epochs=500, pretrain_epochs=100)
     
-    # Evaluation
+    y_pred_cpu = y_pred.cpu()
     metrics = CDBNE_Evaluator.evaluate(data.y.cpu().numpy(), y_pred_cpu.numpy())
     print("\nFinal Results:")
     for metric, value in metrics.items():
         print(f"{metric}: {value:.4f}")
     
-    # Visualization
     with torch.no_grad():
         embeddings, _, _ = model(data.x, data.edge_index)
         embeddings = embeddings.cpu().numpy()
-        
-    CDBNE_Visualizer.plot_tsne(
-        embeddings=embeddings,
-        labels=y_pred_cpu.numpy(),
-        title='CDBNE Embeddings Visualization'
-    )
+    
+    CDBNE_Visualizer.plot_tsne(embeddings, y_pred_cpu.numpy(), 'CDBNE Embeddings Visualization')
 
+
+#%%
 if __name__ == "__main__":
     main()
+
+
 # %%
