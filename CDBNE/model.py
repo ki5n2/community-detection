@@ -214,9 +214,9 @@ class CDBNE_Trainer:
                 best_z = z.detach()
             
             # Check for convergence
-            if epoch > 0 and abs(loss.item() - best_loss) < 1e-6:
-                print("Converged early at epoch", epoch)
-                break
+            # if epoch > 0 and abs(loss.item() - best_loss) < 1e-6:
+            #     print("Converged early at epoch", epoch)
+            #     break
             
         # Initialize cluster centers using K-means
         kmeans = KMeans(n_clusters=self.model.n_clusters, n_init=20)
@@ -384,7 +384,7 @@ def main():
     data_obj = prepare_data(data.edge_index, data.x, data.num_nodes, device)
     
     print("Starting training...")
-    y_pred = trainer.train(data_obj, epochs=500, pretrain_epochs=100)
+    y_pred = trainer.train(data_obj, epochs=100, pretrain_epochs=10)
     
     y_pred_cpu = y_pred.cpu()
     metrics = CDBNE_Evaluator.evaluate(data.y.cpu().numpy(), y_pred_cpu.numpy())
